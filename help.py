@@ -25,7 +25,6 @@ import json
 import os
 import random
 import re
-import string
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -44,15 +43,15 @@ AUTH_STRATEGY = "Sandbox API Key"
 KEYS_FILE = Path(__file__).parent / "api_keys.json"
 SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
 
-# Searched by name; only the result that also says "Sandbox" is registered.
+# Exact names, searched as-is: each search returns just the Sandbox API.
 APIS_TO_REGISTER = [
-    "Fundamentals Layer API",
-    "Investment Funds Layer API",
-    "Macro Economics",
-    "Regulatory Filings",
-    "Market Data Layer API",
-    "Projects & Capital Investments Layer API",
-    "M&A & Transactions Layer API",
+    "Fundamentals Layer API (Sandbox)",
+    "Investment Funds Layer API (Sandbox)",
+    "Macroeconomic Layer API (Sandbox)",
+    "Regulatory Filings Layer API (Sandbox)",
+    "Market Data Layer API (Sandbox)",
+    "Projects & Capital Investments Layer API (Sandbox)",
+    "M&A & Transactions Layer API (Sandbox)",
 ]
 
 # Kong portal keys look like g6AJfvpkc9IZFLXtqZweoNzO3K0v6dFh (32 alnum chars).
@@ -131,12 +130,23 @@ def create_app(page, email: str, app_name: str, auth_strategy: str) -> str:
     page.goto(APPS_URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_load_state("networkidle", timeout=30_000)
 
-    log("[*] Clicking 'New Application'")
-    click_button(page, "New Application")
-
     # The form is a slide-out panel ("Create an Application"), not a dialog.
     name_input = page.get_by_placeholder(re.compile(r"name for your application", re.I))
-    name_input.wait_for(state="visible", timeout=15_000)
+
+    # The button that opens the form is labelled differently depending on the
+    # view: try "Create application" first, then "New Application".
+    for label in ("Create application", "New Application"):
+        log(f"[*] Trying '{label}' button")
+        try:
+            click_button(page, label, timeout=8_000)
+            name_input.wait_for(state="visible", timeout=8_000)
+            log(f"[+] Opened form with '{label}'")
+            break
+        except PlaywrightTimeoutError:
+            log(f"    [!] '{label}' not found or form did not open")
+    else:
+        screenshot(page, "no_create_button")
+        raise RuntimeError("Neither 'Create application' nor 'New Application' opened the form.")
     name_input.fill(app_name)
     log(f"[*] Application name: {app_name}")
 
@@ -212,18 +222,6 @@ def select_auth_strategy(page, wanted: str) -> None:
     option.first.click()
 
 
-def visible_panel_input(page):
-    """The search box inside whatever panel/modal was just opened."""
-    inputs = page.locator("input:visible")
-    for i in range(inputs.count() - 1, -1, -1):
-        inp = inputs.nth(i)
-        placeholder = (inp.get_attribute("placeholder") or "").lower()
-        if "applications by name" in placeholder:
-            continue  # the apps list search box behind the panel
-        return inp
-    return None
-
-
 def extract_key(page) -> str:
     """Read the key text from the open credential panel."""
     candidates = []
@@ -266,70 +264,104 @@ def save_key(email: str, app_name: str, api_key: str) -> None:
     log(f"[+] Saved key to {KEYS_FILE}")
 
 
-def find_sandbox_option(page, search, api_name: str):
-    """Return the search result whose text has the API name AND 'Sandbox'."""
-    pattern = re.compile(rf"{re.escape(api_name)}.*sandbox|sandbox.*{re.escape(api_name)}", re.I | re.S)
-
-    options = page.get_by_role("option").filter(has_text=pattern).filter(visible=True)
-    if options.count():
-        return options.first
-
-    # Fallback: text matches below the search box (skips already-registered
-    # APIs listed elsewhere on the app page), closest first.
-    box = search.bounding_box() or {"y": 0, "height": 0}
-    top = box["y"] + box["height"]
-    best, best_dist = None, None
-    matches = page.get_by_text(pattern).filter(visible=True)
-    for i in range(matches.count()):
-        el = matches.nth(i)
-        el_box = el.bounding_box()
-        if not el_box or el_box["y"] < top:
-            continue
-        dist = el_box["y"] - top
-        if best_dist is None or dist < best_dist:
-            best, best_dist = el, dist
-    return best
+# The card button says "Register"; after registering it becomes "Unregister API".
+REGISTER_BTN = re.compile(r"^\s*register(\s+api)?\s*$", re.I)
+UNREGISTER_BTN = re.compile(r"^\s*unregister(\s+api)?\s*$", re.I)
 
 
-def register_api(page, api_name: str) -> bool:
-    log(f"[*] Registering: {api_name}")
+def sandbox_pattern(api_name: str):
+    # Full name; card titles wrap onto two lines, so allow any whitespace.
+    words = r"\s+".join(re.escape(w) for w in api_name.split())
+    return re.compile(words, re.I)
+
+
+def open_register_panel(page):
+    """Click 'Register an API' and return (panel, search input)."""
+    log("[*] Opening 'Register an API' panel")
     click_button(page, "Register an API")
-    page.wait_for_timeout(1_500)
+    header = re.compile(r"add apis to", re.I)
+    page.get_by_text(header).first.wait_for(state="visible", timeout=15_000)
+    # Deepest element holding both the "Add APIs to ..." title and an input.
+    panel = page.locator("div").filter(has_text=header).filter(has=page.locator("input")).last
+    search = panel.locator("input:visible").first
+    search.wait_for(state="visible", timeout=15_000)
+    return panel, search
 
-    search = visible_panel_input(page)
-    if search is None:
-        screenshot(page, "register_no_search")
-        page.keyboard.press("Escape")
-        return False
+
+def sandbox_card(panel, api_name: str):
+    """The result card for exactly `api_name` (never a Production card)."""
+    btn = panel.page.get_by_text(re.compile(r"^\s*(un)?register(\s+api)?\s*$", re.I))
+    return (
+        panel.locator("div")
+        .filter(has_text=sandbox_pattern(api_name))
+        .filter(has_not_text=re.compile(r"\(production\)", re.I))
+        .filter(has=btn)
+        .last
+    )
+
+
+def register_api(page, panel, search, api_name: str) -> bool:
+    log(f"[*] Registering: {api_name}")
+
+    # Clear the previous search, then type the next API name.
     search.click()
+    search.fill("")
+    page.wait_for_timeout(500)
     search.fill(api_name)
-    page.wait_for_timeout(1_500)
+    page.wait_for_timeout(2_000)
 
-    option = find_sandbox_option(page, search, api_name)
-    if option is None:
+    card = sandbox_card(panel, api_name)
+    try:
+        card.wait_for(state="visible", timeout=15_000)
+    except PlaywrightTimeoutError:
         log(f"[!] No Sandbox result for '{api_name}'")
         screenshot(page, "api_not_found")
-        page.keyboard.press("Escape")
         return False
-    log(f"    -> picking: {option.inner_text().strip().splitlines()[0]}")
-    option.click()
-    page.wait_for_timeout(500)
 
-    # Confirm: the last visible "Register…" button (not "Register an API").
-    register_re = re.compile(r"^\s*register(?!\s+an\s+api)", re.I)
-    submit = page.get_by_role("button", name=register_re).filter(visible=True)
-    if submit.count() == 0:
-        submit = page.get_by_text(register_re).filter(visible=True)
-    try:
-        submit.last.click(timeout=15_000)
-        search.wait_for(state="hidden", timeout=15_000)
-    except PlaywrightTimeoutError:
-        screenshot(page, "register_dialog_stuck")
-        page.keyboard.press("Escape")
+    if card.get_by_text(UNREGISTER_BTN).count():
+        log(f"[=] Already registered: {api_name}")
+        return True
+
+    card.get_by_text(REGISTER_BTN).first.click(timeout=15_000)
+    # Success = button turns into "Unregister API" (or "Register" disappears,
+    # e.g. when the API goes to pending approval).
+    for _ in range(40):
+        page.wait_for_timeout(500)
+        if card.get_by_text(UNREGISTER_BTN).count() or not card.get_by_text(REGISTER_BTN).count():
+            break
+    else:
+        log(f"[!] '{api_name}' still shows 'Register' after clicking")
+        screenshot(page, "register_failed")
         return False
     log(f"[+] Registered: {api_name}")
-    page.wait_for_timeout(1_000)
     return True
+
+
+def register_all(page, names) -> list:
+    panel, search = open_register_panel(page)
+    failed = [name for name in names if not register_api(page, panel, search, name)]
+    # Close the panel (X button / Escape) so the app page shows the list.
+    page.keyboard.press("Escape")
+    return failed
+
+
+NAME_PREFIXES = [
+    "Nova", "Astra", "Falcon", "Orbit", "Zenith", "Atlas", "Cobalt", "Vertex",
+    "Quanta", "Summit", "Harbor", "Pioneer", "Lumen", "Apex", "Sierra", "Delta",
+]
+NAME_SUFFIXES = [
+    "Labs", "Insights", "Data", "Analytics", "Capital", "Markets", "Metrics",
+    "Signals", "Research", "Ventures", "Finance", "Pulse", "Edge", "Works",
+]
+
+
+def random_app_name() -> str:
+    """Random name like 'NovaInsights7' (number 1-10)."""
+    return (
+        random.choice(NAME_PREFIXES)
+        + random.choice(NAME_SUFFIXES)
+        + str(random.randint(1, 10))
+    )
 
 
 def main() -> None:
@@ -337,7 +369,7 @@ def main() -> None:
     parser.add_argument(
         "--app-name",
         default=None,
-        help="app name (default: random, e.g. LexBiz-k3f9q2, since names must be unique)",
+        help="app name (default: random, e.g. NovaInsights7)",
     )
     parser.add_argument("--headed", action="store_true", help="show the browser")
     parser.add_argument(
@@ -348,8 +380,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     if not args.app_name:
-        suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        args.app_name = f"LexBiz-{suffix}"
+        args.app_name = random_app_name()
 
     load_dotenv()
     email = os.getenv("ARGAAM_EMAIL", "").strip()
@@ -370,7 +401,7 @@ def main() -> None:
             page.wait_for_load_state("networkidle", timeout=30_000)
             log(f"[*] App page: {page.url}")
 
-            failed = [name for name in APIS_TO_REGISTER if not register_api(page, name)]
+            failed = register_all(page, APIS_TO_REGISTER)
             ok = len(APIS_TO_REGISTER) - len(failed)
             log(f"\n[+] Registered {ok}/{len(APIS_TO_REGISTER)} APIs")
             if failed:
