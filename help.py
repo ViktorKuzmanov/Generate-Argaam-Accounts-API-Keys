@@ -247,20 +247,50 @@ def read_clipboard(page) -> str:
     return m.group(0) if m else ""
 
 
+def load_accounts() -> list:
+    """Return api_keys.json as a list of accounts:
+    [{"email": ..., "api_keys": [{"app", "api_key", "created_at"}, ...]}, ...]
+    Old flat entries ({"email", "app", "api_key", "created_at"}) are folded in."""
+    if not KEYS_FILE.exists():
+        return []
+    try:
+        raw = json.loads(KEYS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    accounts: list = []
+    by_email: dict = {}
+    for entry in raw if isinstance(raw, list) else []:
+        email = entry.get("email")
+        if not email:
+            continue
+        acc = by_email.get(email)
+        if acc is None:
+            acc = {"email": email, "api_keys": []}
+            by_email[email] = acc
+            accounts.append(acc)
+        if "api_keys" in entry:
+            acc["api_keys"].extend(entry["api_keys"])
+        else:  # legacy flat entry
+            acc["api_keys"].append({
+                "app": entry.get("app"),
+                "api_key": entry.get("api_key"),
+                "created_at": entry.get("created_at"),
+            })
+    return accounts
+
+
 def save_key(email: str, app_name: str, api_key: str) -> None:
-    data = []
-    if KEYS_FILE.exists():
-        try:
-            data = json.loads(KEYS_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = []
-    data.append({
-        "email": email,
+    accounts = load_accounts()
+    acc = next((a for a in accounts if a["email"] == email), None)
+    if acc is None:
+        acc = {"email": email, "api_keys": []}
+        accounts.append(acc)
+    acc["api_keys"].append({
         "app": app_name,
         "api_key": api_key,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     })
-    KEYS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    KEYS_FILE.write_text(json.dumps(accounts, indent=2), encoding="utf-8")
     log(f"[+] Saved key to {KEYS_FILE}")
 
 
