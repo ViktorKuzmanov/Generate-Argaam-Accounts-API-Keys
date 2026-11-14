@@ -16,10 +16,10 @@ Credentials come from .env (never hard-code them here):
 
 Usage:
 
-    python help.py                       # 10 apps, random names, headless
+    python help.py                       # 10 apps, random names, headless (no window)
     python help.py --count 3             # only 3 apps
     python help.py --app-name LexBiz     # LexBiz1 ... LexBiz10
-    python help.py --headed              # watch the browser
+    python help.py --headed              # show the browser window (for debugging)
 """
 
 import argparse
@@ -145,7 +145,15 @@ def back_to_applications(page) -> None:
     page.wait_for_load_state("networkidle", timeout=30_000)
 
 
-def create_app(page, email: str, app_name: str, auth_strategy: str) -> str:
+# Account with no apps yet: the empty /apps page shows "Create application".
+# Once it has an app, the list shows only "New Application".
+FIRST_APP_BUTTONS = ("Create application", "New Application")
+NEXT_APP_BUTTONS = ("New Application",)
+
+
+def create_app(
+    page, email: str, app_name: str, auth_strategy: str, buttons=FIRST_APP_BUTTONS
+) -> str:
     if not is_apps_list(page.url):
         log(f"[*] Opening {APPS_URL}")
         page.goto(APPS_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -154,9 +162,8 @@ def create_app(page, email: str, app_name: str, auth_strategy: str) -> str:
     # The form is a slide-out panel ("Create an Application"), not a dialog.
     name_input = page.get_by_placeholder(re.compile(r"name for your application", re.I))
 
-    # The button that opens the form is labelled differently depending on the
-    # view: try "Create application" first, then "New Application".
-    for label in ("Create application", "New Application"):
+    # `buttons` is tried in order until one opens the form.
+    for label in buttons:
         log(f"[*] Trying '{label}' button")
         try:
             click_button(page, label, timeout=8_000)
@@ -167,7 +174,8 @@ def create_app(page, email: str, app_name: str, auth_strategy: str) -> str:
             log(f"    [!] '{label}' not found or form did not open")
     else:
         screenshot(page, "no_create_button")
-        raise RuntimeError("Neither 'Create application' nor 'New Application' opened the form.")
+        tried = " / ".join(f"'{b}'" for b in buttons)
+        raise RuntimeError(f"No button opened the create form (tried {tried}).")
     name_input.fill(app_name)
     log(f"[*] Application name: {app_name}")
 
@@ -431,10 +439,8 @@ def app_names(base: str | None, count: int, taken: set) -> list:
     return names
 
 
-def run_one_app(page, email: str, app_name: str, auth: str) -> tuple:
-    """Create one app, register all APIs. Returns (api_key, failed_apis)."""
-    api_key = create_app(page, email, app_name, auth)
-
+def register_on_app_page(page, app_name: str) -> list:
+    """On the new app's page, register all APIs. Returns the failed API names."""
     # After "Copy and close" the app page should be open.
     page.wait_for_load_state("networkidle", timeout=30_000)
     log(f"[*] App page: {page.url}")
@@ -444,7 +450,7 @@ def run_one_app(page, email: str, app_name: str, auth: str) -> tuple:
     log(f"[+] Registered {ok}/{len(APIS_TO_REGISTER)} APIs for {app_name}")
     if failed:
         log("[!] Failed: " + ", ".join(failed))
-    return api_key, failed
+    return failed
 
 
 def main() -> None:
@@ -454,7 +460,11 @@ def main() -> None:
         default=None,
         help="app name (default: random, e.g. NovaInsights7)",
     )
-    parser.add_argument("--headed", action="store_true", help="show the browser")
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="show the browser window (default: headless, no window)",
+    )
     parser.add_argument(
         "--auth",
         default=AUTH_STRATEGY,
@@ -493,12 +503,18 @@ def main() -> None:
         page = context.new_page()
         try:
             login(page, email, password)
+            # Becomes True once this run has created an app; from then on the
+            # account has an app, so only "New Application" exists.
+            has_app = False
             for i, app_name in enumerate(names, 1):
                 log(f"\n===== App {i}/{len(names)}: {app_name} =====")
                 if i > 1:
                     back_to_applications(page)
+                buttons = NEXT_APP_BUTTONS if has_app else FIRST_APP_BUTTONS
                 try:
-                    api_key, failed = run_one_app(page, email, app_name, args.auth)
+                    api_key = create_app(page, email, app_name, args.auth, buttons)
+                    has_app = True
+                    failed = register_on_app_page(page, app_name)
                     results.append((app_name, api_key, failed))
                 except (PlaywrightTimeoutError, RuntimeError) as exc:
                     # Keep going with the next app; the next loop iteration
