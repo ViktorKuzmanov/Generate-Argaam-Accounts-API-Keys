@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Log in to the Argaam developer portal, create an app and register APIs.
+"""Log in to the Argaam developer portal, create apps and register APIs.
 
 Steps:
   1. Log in at https://developer.argaam.com/login
@@ -7,6 +7,7 @@ Steps:
   3. New Application -> name -> Create Application
   4. Read the API key shown in the dialog, print it, save it, "Copy and close"
   5. On the app page: "Register an API" -> search each API -> register it
+  6. Click "<- Applications" and repeat 3-5 until --count apps are made (default 10)
 
 Credentials come from .env (never hard-code them here):
 
@@ -15,8 +16,9 @@ Credentials come from .env (never hard-code them here):
 
 Usage:
 
-    python help.py                       # random app name, headless
-    python help.py --app-name LexBiz2
+    python help.py                       # 10 apps, random names, headless
+    python help.py --count 3             # only 3 apps
+    python help.py --app-name LexBiz     # LexBiz1 ... LexBiz10
     python help.py --headed              # watch the browser
 """
 
@@ -125,9 +127,28 @@ def login(page, email: str, password: str) -> None:
     log(f"[+] Logged in -> {page.url}")
 
 
+def is_apps_list(url: str) -> bool:
+    return url.rstrip("/").split("?")[0] == APPS_URL
+
+
+def back_to_applications(page) -> None:
+    """Click the '<- Applications' back link on the app page.
+    Falls back to opening /apps directly if the link isn't found."""
+    log("[*] Clicking '<- Applications'")
+    try:
+        link = page.get_by_role("link", name=re.compile(r"applications", re.I))
+        link.first.click(timeout=10_000)
+        page.wait_for_url(is_apps_list, timeout=15_000)
+    except PlaywrightTimeoutError:
+        log("    [!] Back link not found, opening /apps directly")
+        page.goto(APPS_URL, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_load_state("networkidle", timeout=30_000)
+
+
 def create_app(page, email: str, app_name: str, auth_strategy: str) -> str:
-    log(f"[*] Opening {APPS_URL}")
-    page.goto(APPS_URL, wait_until="domcontentloaded", timeout=60_000)
+    if not is_apps_list(page.url):
+        log(f"[*] Opening {APPS_URL}")
+        page.goto(APPS_URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_load_state("networkidle", timeout=30_000)
 
     # The form is a slide-out panel ("Create an Application"), not a dialog.
@@ -385,13 +406,45 @@ NAME_SUFFIXES = [
 ]
 
 
-def random_app_name() -> str:
-    """Random name like 'NovaInsights7' (number 1-10)."""
-    return (
-        random.choice(NAME_PREFIXES)
-        + random.choice(NAME_SUFFIXES)
-        + str(random.randint(1, 10))
-    )
+def random_app_name(taken: set | None = None) -> str:
+    """Random name like 'NovaInsights7' (number 1-10), not in `taken`."""
+    taken = taken or set()
+    for _ in range(1_000):
+        name = (
+            random.choice(NAME_PREFIXES)
+            + random.choice(NAME_SUFFIXES)
+            + str(random.randint(1, 10))
+        )
+        if name not in taken:
+            return name
+    raise RuntimeError("Could not find an unused random app name.")
+
+
+def app_names(base: str | None, count: int, taken: set) -> list:
+    """`count` unique names. With --app-name X and count > 1: X1, X2, ..."""
+    if base:
+        return [base] if count == 1 else [f"{base}{i}" for i in range(1, count + 1)]
+    names: list = []
+    for _ in range(count):
+        name = random_app_name(taken | set(names))
+        names.append(name)
+    return names
+
+
+def run_one_app(page, email: str, app_name: str, auth: str) -> tuple:
+    """Create one app, register all APIs. Returns (api_key, failed_apis)."""
+    api_key = create_app(page, email, app_name, auth)
+
+    # After "Copy and close" the app page should be open.
+    page.wait_for_load_state("networkidle", timeout=30_000)
+    log(f"[*] App page: {page.url}")
+
+    failed = register_all(page, APIS_TO_REGISTER)
+    ok = len(APIS_TO_REGISTER) - len(failed)
+    log(f"[+] Registered {ok}/{len(APIS_TO_REGISTER)} APIs for {app_name}")
+    if failed:
+        log("[!] Failed: " + ", ".join(failed))
+    return api_key, failed
 
 
 def main() -> None:
@@ -408,9 +461,15 @@ def main() -> None:
         choices=["Sandbox API Key", "Production API Key"],
         help="auth strategy for the new app",
     )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=10,
+        help="how many apps to create, one after another (default: 10)",
+    )
     args = parser.parse_args()
-    if not args.app_name:
-        args.app_name = random_app_name()
+    if args.count < 1:
+        sys.exit("[x] --count must be at least 1")
 
     load_dotenv()
     email = os.getenv("ARGAAM_EMAIL", "").strip()
@@ -418,6 +477,15 @@ def main() -> None:
     if not email or not password:
         sys.exit("[x] Set ARGAAM_EMAIL and ARGAAM_PASSWORD in .env")
 
+    # Don't reuse names already saved for this account.
+    taken = {
+        k.get("app")
+        for a in load_accounts() if a["email"] == email
+        for k in a["api_keys"]
+    }
+    names = app_names(args.app_name, args.count, taken)
+
+    results = []  # (app_name, api_key or None, failed_apis or error)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not args.headed)
         context = browser.new_context(viewport={"width": 1440, "height": 900})
@@ -425,24 +493,36 @@ def main() -> None:
         page = context.new_page()
         try:
             login(page, email, password)
-            api_key = create_app(page, email, args.app_name, args.auth)
-
-            # After "Copy and close" the app page should be open.
-            page.wait_for_load_state("networkidle", timeout=30_000)
-            log(f"[*] App page: {page.url}")
-
-            failed = register_all(page, APIS_TO_REGISTER)
-            ok = len(APIS_TO_REGISTER) - len(failed)
-            log(f"\n[+] Registered {ok}/{len(APIS_TO_REGISTER)} APIs")
-            if failed:
-                log("[!] Failed: " + ", ".join(failed))
-            log(f"\nAPI key: {api_key}")
+            for i, app_name in enumerate(names, 1):
+                log(f"\n===== App {i}/{len(names)}: {app_name} =====")
+                if i > 1:
+                    back_to_applications(page)
+                try:
+                    api_key, failed = run_one_app(page, email, app_name, args.auth)
+                    results.append((app_name, api_key, failed))
+                except (PlaywrightTimeoutError, RuntimeError) as exc:
+                    # Keep going with the next app; the next loop iteration
+                    # returns to /apps (falls back to a direct goto).
+                    log(f"[x] App {app_name} failed: {exc}")
+                    screenshot(page, f"error_{app_name}")
+                    results.append((app_name, None, str(exc)))
         except Exception:
             screenshot(page, "error")
             raise
         finally:
             context.close()
             browser.close()
+
+            log("\n===== Summary =====")
+            for app_name, api_key, failed in results:
+                if api_key is None:
+                    log(f"[x] {app_name}: FAILED ({failed})")
+                elif failed:
+                    log(f"[!] {app_name}: {api_key}  (not registered: {', '.join(failed)})")
+                else:
+                    log(f"[+] {app_name}: {api_key}")
+            done = sum(1 for _, k, _ in results if k)
+            log(f"\n{done}/{len(names)} apps created")
 
 
 if __name__ == "__main__":
